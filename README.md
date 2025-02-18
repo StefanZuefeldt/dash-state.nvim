@@ -1,0 +1,2 @@
+# dashext.nvim
+Dashboard extensions
