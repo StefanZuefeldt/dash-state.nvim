@@ -2,81 +2,101 @@ if not table.unpack then
   table.unpack = unpack
 end
 
-local global_state = {}
+local M = {}
 
-global_state.state = nil
-global_state.page = 0
+M.state = nil
+M.page = 0
 -- Consider updating .page to be a table keyed by state name?  Would need a compelling argument
 
-global_state.checkState = function(checkState, other)
-  return function()
-    if type(other) ~= 'function' or other() then
-      if type(checkState) == 'table' then
-        if global_state.state == nil and checkState['nil'] then
-          return true
-        end
+---@alias dash-state.State nil|string|string[]|{nil:boolean}
 
-        for _,v in ipairs(checkState) do
-          local result = (v == global_state.state)
-          if result then
-            return true
-          end
-        end
-        return false
-      else
-        return global_state.state == checkState
+---Checks whether the state object should be considered active
+---@param state dash-state.State
+M.check_state = function(state)
+  if type(state) == 'table' then
+    if M.state == nil and state['nil'] then
+      return true
+    end
+
+    for _,v in ipairs(state) do
+      local result = (v == M.state)
+      if result then
+        return true
       end
     end
+    return false
+  else
+    return M.state == state
   end
 end
 
-global_state.extension = {
+M.extension = {
   templates = {
+    ---Creates a section that displays when the state is set
+    ---  as: The built-in section or template to use when enabled
+    ---  state: The state or set of states to be enabled on.  Default: nil, displays when no state.
+    ---@param opts {as?:string, state?:dash-state.State, section?:string, content?:table<string,any>}
     stateful = function(opts)
-      if opts.content ~= nil then
-        opts.content.enabled = global_state.checkState(opts.state, opts.content.enabled)
-
-        return opts.content
-      else
-        opts.section = opts.as
-        opts.enabled = global_state.checkState(opts.state, opts.enabled)
-
-        return opts
+      -- Move all data into content once
+      local content = opts.content or {}
+      if not opts.content then
+        for k,v in pairs(opts) do
+          if k == 'as' then
+            content['section'] = v
+          elseif k ~= 'section' and k ~= 'state' then
+            content[k] = v
+            opts[k] = nil
+          end
+        end
+        opts.content = content
       end
+
+      -- Return content or dont
+      if M.check_state(opts.state) then
+        return content
+      end
+      return {}
     end,
 
+    ---Turns the contents into a collapsed table of items
+    ---When collapsed, state is unset, and limits display to current limit
+    ---When expanded, state is set, and limit is increased to expanded_limit
+    ---  Additionally, if show_all is set, a Show All option will display
+    ---@param opts {state:dash-state.State, closed_state?:dash-state.State, limit?:number, expanded_limit?:number, key?:any, show_all?:fun(), content?:table<string,any>}
     show_more = function(opts)
       local closed_state = opts.closed_state
       local state = opts.state
       local limit = opts.limit or 5
       local expanded_limit = opts.expanded_limit or 30
-      local content = opts.content
+      local content = opts.content or {}
+      opts.content = content
 
-      if type(content) ~= 'table' then
+      for k,v in ipairs(opts) do
+        content[k] = v
+        opts[k] = nil
+      end
+
+      if next(content) == nil then
         return {}
       end
 
       local apply_limit = nil
-      if global_state.state == closed_state then
+      if M.check_state(closed_state) then
         apply_limit = limit
-      elseif global_state.state == state then
+      elseif M.check_state(state) then
         apply_limit = expanded_limit
       else
         return {}
       end
 
-      if #content > 0 then
-        for _,v in pairs(content) do
-          v.limit = apply_limit + 1
-        end
-      else
-        content.limit = apply_limit + 1
+      for _,v in ipairs(content) do
+        v.limit = apply_limit + 1
       end
 
       return function(dashboard)
         local resolved = dashboard:resolve(content, {}, opts)
 
-        if global_state.state == closed_state then
+        if M.state == closed_state then
           if #resolved > apply_limit then
             resolved[apply_limit + 1] = {
               icon = '',
@@ -84,7 +104,7 @@ global_state.extension = {
               key = opts.key,
               autokey = opts.key == nil,
               action = function()
-                global_state.state = state
+                M.state = state
                 dashboard:update()
               end,
             }
@@ -113,7 +133,7 @@ global_state.extension = {
                 key = opts.key,
                 autokey = opts.key == nil,
                 action = function()
-                  global_state.state = closed_state
+                  M.state = closed_state
                   dashboard:update()
                 end,
               },
@@ -125,41 +145,61 @@ global_state.extension = {
     end,
 
 
+    ---Turns the contents into paging table of items
+    ---  per_page controls how many items show
+    ---  if collapse is set, will collapse to a limited view similar to show_more, controlled by limit
+    ---    collapse will also use the state and closed_state parameters like show_more
+    ---  <PageDown> and <PageUp> can be used to traverse between pages
+    ---@param opts {
+      ---collapse?:boolean,
+      ---state:dash-state.State, 
+      ---closed_state?:dash-state.State, 
+      ---limit?:number, 
+      ---per_page?:number, 
+      ---key?:any, 
+      ---content?:table<string,any>,
+      ---}
     page = function(opts)
+      local collapse = opts.collapse or false
       local closed_state = opts.closed_state
       local state = opts.state
       local limit = opts.limit or 5
       local per_page = opts.per_page or 30
-      local content = {}
+      local content = opts.content or {}
+      opts.content = content
 
-      for k,v in pairs(opts.content) do
+      -- Move children into content instead - prevent double rendering
+      for k,v in ipairs(opts) do
         content[k] = v
+        content[k].original_limit = v.limit
+        opts[k] = nil
       end
 
-      if type(content) ~= 'table' then
+      if next(content) == nil then
         return {}
       end
 
       local apply_limit = nil
-      if global_state.state == closed_state then
+      if collapse and M.state == closed_state then
         apply_limit = limit
 
-        if #content > 0 then
-          for _,v in pairs(content) do
-            v.limit = apply_limit + 1
-          end
-        else
-          content.limit = apply_limit + 1
+        for _,v in ipairs(content) do
+          v.limit = apply_limit + 1
         end
-      elseif global_state.state ~= state then
+      elseif collapse and M.state ~= state then
         return {}
+      else
+        for _,v in ipairs(content) do
+          v.limit = v.original_limit
+        end
       end
 
       return function(dashboard)
-        -- TODO - consider caching?  Maybe a separate type actually
+        vim.print(vim.inspect(content))
         local resolved = dashboard:resolve(content, {}, opts)
+        vim.print(vim.inspect(resolved))
 
-        if global_state.state == closed_state then
+        if collapse and M.state == closed_state then
           if #resolved > apply_limit then
             resolved = {table.unpack(resolved, 1, apply_limit)}
 
@@ -169,8 +209,8 @@ global_state.extension = {
               key = opts.key,
               autokey = opts.key == nil,
               action = function()
-                global_state.state = state
-                global_state.page = 0
+                M.state = state
+                M.page = 0
                 dashboard:update()
               end,
             }
@@ -179,7 +219,7 @@ global_state.extension = {
           return resolved
         else
           local total = #resolved
-          local from = (global_state.page * per_page) + 1
+          local from = (M.page * per_page) + 1
           local to = math.min(from + per_page, #resolved)
 
           resolved = {table.unpack(resolved, from, to)}
@@ -195,7 +235,7 @@ global_state.extension = {
               key = '<PageDown>',
               action = function()
                 -- Key doesnt get unbound when updated without the key
-                global_state.page = ((global_state.page < (total_pages - 1) and global_state.page + 1) or global_state.page)
+                M.page = ((M.page < (total_pages - 1) and M.page + 1) or M.page)
                 dashboard:update()
               end
             }
@@ -203,24 +243,24 @@ global_state.extension = {
 
           return {
             {
-              {
+              collapse and {
                 icon = '',
                 desc = 'Return',
                 key = opts.key,
                 autokey = opts.key == nil,
                 padding = 1,
                 action = function()
-                  global_state.state = closed_state
-                  global_state.page = 0
+                  M.state = closed_state
+                  M.page = 0
                   dashboard:update()
                 end,
-              },
-              global_state.page > 0 and {
+              } or {},
+              M.page > 0 and {
                 icon = '',
                 desc = 'Previous Page',
                 key = '<PageUp>',
                 action = function()
-                  global_state.page = ((global_state.page > 0 and global_state.page - 1) or 0)
+                  M.page = ((M.page > 0 and M.page - 1) or 0)
                   dashboard:update()
                 end
               } or {},
@@ -239,4 +279,4 @@ global_state.extension = {
   }
 }
 
-return global_state
+return M
