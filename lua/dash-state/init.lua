@@ -195,9 +195,7 @@ M.extension = {
       end
 
       return function(dashboard)
-        vim.print(vim.inspect(content))
         local resolved = dashboard:resolve(content, {}, opts)
-        vim.print(vim.inspect(resolved))
 
         if collapse and M.state == closed_state then
           if #resolved > apply_limit then
