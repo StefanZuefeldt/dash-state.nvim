@@ -1,7 +1,3 @@
-if not table.unpack then
-  table.unpack = unpack
-end
-
 local M = {}
 
 M.state = nil
@@ -15,19 +11,15 @@ M.pages = {}
 ---@field row? number
 
 ---@class dash-state.Config
----@field reset_on_open? boolean Reset state and pages whenever a new dashboard opens. Default: true
----@field clear_keys? boolean Unbind the previous render's item keys before redrawing. Default: true
+---@field reset_on_open? boolean Reset state and pages whenever a new dashboard opens. Default: true.
+---  State is shared by all dashboards, so this also resets any dashboard already open elsewhere.
 ---@field layouts? table<string, dash-state.Layout> Dashboard layout overrides keyed by state name
 
 ---@type dash-state.Config
 local config = {
   reset_on_open = true,
-  clear_keys = true,
   layouts = {},
 }
-
--- Keys snacks binds itself when the dashboard opens; never unbind these
-local protected_keys = { q = true, ['<esc>'] = true, ['<cr>'] = true }
 
 ---@param opts? dash-state.Config
 M.setup = function(opts)
@@ -75,16 +67,28 @@ M.set_page = function(state, page)
   M.pages[tostring(primary(state))] = page
 end
 
----Switches state, starts its pages over, and redraws
+---Switches state, starts all pages over, and redraws
 ---@param state dash-state.State
 ---@param dashboard? snacks.dashboard.Class Redraws every open dashboard when omitted
 M.set_state = function(state, dashboard)
   M.state = primary(state)
-  M.set_page(M.state, 0)
+  -- All of them, not just this state's: a section with a table state reads its page under state[1],
+  -- which may not be the state being entered
+  M.pages = {}
   if dashboard then
     dashboard:update()
   else
     require('snacks').dashboard.update()
+  end
+end
+
+---Selects a whole section tree by state: `views[state]`, falling back to `views.default`.
+---  sections = { require('dash-state').views({ default = {...}, worklist = {...} }) }
+---Each update renders a fresh copy, because snacks and these templates modify section tables in place.
+---@param views table<string, table>
+M.views = function(views)
+  return function()
+    return vim.deepcopy((M.state and views[M.state]) or views.default or {})
   end
 end
 
@@ -107,15 +111,78 @@ local function on_update(dashboard)
   end
   dashboard.opts.width = width and math.max(math.floor(width), base.width) or base.width
   dashboard.opts.row = layout.row or base.row
+end
 
-  -- Snacks only ever binds item keys, so keys from sections hidden by a state change
-  -- would otherwise keep running their old actions
-  if config.clear_keys then
-    for _,item in ipairs(dashboard.items or {}) do
-      if item.key and item.key ~= '' and not protected_keys[item.key:lower()] then
-        pcall(vim.keymap.del, 'n', item.key, { buffer = dashboard.buf })
-      end
+local function show_more_item(opts, dashboard)
+  return {
+    icon = '\u{eaf3}',
+    desc = 'Show More...',
+    key = opts.key,
+    autokey = opts.key == nil,
+    action = function()
+      M.set_state(opts.state, dashboard)
+    end,
+  }
+end
+
+local function return_item(opts, dashboard, padding)
+  return {
+    icon = '\u{eaf4}',
+    desc = 'Return',
+    key = opts.key,
+    autokey = opts.key == nil,
+    padding = padding,
+    action = function()
+      M.set_state(opts.closed_state, dashboard)
+    end,
+  }
+end
+
+---Shared core of show_more and page. While `closed_state` is active the children are cut to `limit`
+---plus a Show More item; while `state` is active `open` builds the expanded view.
+---@param opts table The section's options; positional children are moved into opts.content once
+---@param spec {collapse:boolean, limit:number, open_limit?:number, open:fun(resolved:table, dashboard:snacks.dashboard.Class):table}
+local function expandable(opts, spec)
+  -- Move children into content instead - prevent double rendering
+  local content = opts.content or {}
+  opts.content = content
+  for k,v in ipairs(opts) do
+    content[k] = v
+    content[k].original_limit = v.limit
+    opts[k] = nil
+  end
+
+  if next(content) == nil then
+    return {}
+  end
+
+  local collapsed = spec.collapse and M.check_state(opts.closed_state)
+  if spec.collapse and not collapsed and not M.check_state(opts.state) then
+    return {}
+  end
+
+  -- One extra item reveals whether there is more to show
+  for _,v in ipairs(content) do
+    if collapsed then
+      v.limit = spec.limit + 1
+    elseif spec.open_limit then
+      v.limit = spec.open_limit + 1
+    else
+      v.limit = v.original_limit
     end
+  end
+
+  return function(dashboard)
+    local resolved = dashboard:resolve(content, {}, opts)
+
+    if collapsed then
+      if #resolved > spec.limit then
+        resolved = vim.list_slice(resolved, 1, spec.limit)
+        resolved[spec.limit + 1] = show_more_item(opts, dashboard)
+      end
+      return resolved
+    end
+    return spec.open(resolved, dashboard)
   end
 end
 
@@ -153,83 +220,28 @@ M.extension = {
     ---  Additionally, if show_all is set, a Show All option will display
     ---@param opts {state:dash-state.State, closed_state?:dash-state.State, limit?:number, expanded_limit?:number, key?:any, show_all?:fun(), content?:table<string,any>}
     show_more = function(opts)
-      local closed_state = opts.closed_state
-      local state = opts.state
-      local limit = opts.limit or 5
       local expanded_limit = opts.expanded_limit or 30
-      local content = opts.content or {}
-      opts.content = content
 
-      for k,v in ipairs(opts) do
-        content[k] = v
-        opts[k] = nil
-      end
-
-      if next(content) == nil then
-        return {}
-      end
-
-      local collapsed = M.check_state(closed_state)
-      local apply_limit = nil
-      if collapsed then
-        apply_limit = limit
-      elseif M.check_state(state) then
-        apply_limit = expanded_limit
-      else
-        return {}
-      end
-
-      for _,v in ipairs(content) do
-        v.limit = apply_limit + 1
-      end
-
-      return function(dashboard)
-        local resolved = dashboard:resolve(content, {}, opts)
-
-        if collapsed then
-          if #resolved > apply_limit then
-            resolved[apply_limit + 1] = {
-              icon = '',
-              desc = 'Show More...',
-              key = opts.key,
-              autokey = opts.key == nil,
-              action = function()
-                M.set_state(state, dashboard)
-              end,
-            }
-          end
-
-          return resolved
-        else
-          if #resolved > apply_limit then
+      return expandable(opts, {
+        collapse = true,
+        limit = opts.limit or 5,
+        open_limit = expanded_limit,
+        open = function(resolved, dashboard)
+          if #resolved > expanded_limit then
+            resolved = vim.list_slice(resolved, 1, expanded_limit)
             if opts.show_all then
-              resolved[apply_limit + 1] = {
-                icon = '󰋅',
+              resolved[expanded_limit + 1] = {
+                icon = '\u{f02c5}',
                 desc = 'Show All',
                 autokey = true,
                 action = opts.show_all
               }
-            else
-              resolved[apply_limit + 1] = nil
             end
           end
 
-          return {
-            {
-              {
-                icon = '',
-                desc = 'Return',
-                key = opts.key,
-                autokey = opts.key == nil,
-                action = function()
-                  M.set_state(closed_state, dashboard)
-                end,
-              },
-              resolved
-            }
-          }
-        end
-      end
+          return { { return_item(opts, dashboard), resolved } }
+        end,
+      })
     end,
 
 
@@ -250,60 +262,13 @@ M.extension = {
       ---}
     page = function(opts)
       local collapse = opts.collapse or false
-      local closed_state = opts.closed_state
       local state = opts.state
-      local limit = opts.limit or 5
       local per_page = opts.per_page or 30
-      local content = opts.content or {}
-      opts.content = content
 
-      -- Move children into content instead - prevent double rendering
-      for k,v in ipairs(opts) do
-        content[k] = v
-        content[k].original_limit = v.limit
-        opts[k] = nil
-      end
-
-      if next(content) == nil then
-        return {}
-      end
-
-      local collapsed = collapse and M.check_state(closed_state)
-      local apply_limit = nil
-      if collapsed then
-        apply_limit = limit
-
-        for _,v in ipairs(content) do
-          v.limit = apply_limit + 1
-        end
-      elseif collapse and not M.check_state(state) then
-        return {}
-      else
-        for _,v in ipairs(content) do
-          v.limit = v.original_limit
-        end
-      end
-
-      return function(dashboard)
-        local resolved = dashboard:resolve(content, {}, opts)
-
-        if collapsed then
-          if #resolved > apply_limit then
-            resolved = {table.unpack(resolved, 1, apply_limit)}
-
-            resolved[apply_limit + 1] = {
-              icon = '',
-              desc = 'Show More...',
-              key = opts.key,
-              autokey = opts.key == nil,
-              action = function()
-                M.set_state(state, dashboard)
-              end,
-            }
-          end
-
-          return resolved
-        else
+      return expandable(opts, {
+        collapse = collapse,
+        limit = opts.limit or 5,
+        open = function(resolved, dashboard)
           local total = #resolved
           local total_pages = math.max(math.ceil(total / per_page), 1)
 
@@ -313,11 +278,11 @@ M.extension = {
 
           local from = (page * per_page) + 1
           local to = math.min(from + per_page - 1, total)
-          local shown = {table.unpack(resolved, from, to)}
+          local shown = vim.list_slice(resolved, from, to)
 
           if page < total_pages - 1 then
             shown[#shown + 1] = {
-              icon = '',
+              icon = '\u{f063}',
               desc = 'Next Page',
               key = '<PageDown>',
               action = function()
@@ -329,18 +294,9 @@ M.extension = {
 
           return {
             {
-              collapse and {
-                icon = '',
-                desc = 'Return',
-                key = opts.key,
-                autokey = opts.key == nil,
-                padding = 1,
-                action = function()
-                  M.set_state(closed_state, dashboard)
-                end,
-              } or {},
+              collapse and return_item(opts, dashboard, 1) or {},
               page > 0 and {
-                icon = '',
+                icon = '\u{f062}',
                 desc = 'Previous Page',
                 key = '<PageUp>',
                 action = function()
@@ -357,14 +313,13 @@ M.extension = {
               }
             }
           }
-        end
-      end
+        end,
+      })
     end
   }
 }
 
----Snacks extension entry point. Use in place of `extension` to get state layouts,
----reset-on-open, and stale key clearing:
+---Snacks extension entry point. Use in place of `extension` to get state layouts and reset-on-open:
 ---  extensions = { function(d) return require('dash-state').dashboard_extension(d) end }
 ---@param dashboard snacks.dashboard.Class
 M.dashboard_extension = function(dashboard)
