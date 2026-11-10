@@ -67,6 +67,22 @@ M.set_page = function(state, page)
   M.pages[tostring(primary(state))] = page
 end
 
+---Puts the cursor on the first rendered row with an `id` (data rows, not Return/Show More/paging)
+---@param dashboard snacks.dashboard.Class
+local function focus_first(dashboard)
+  for _, item in ipairs(dashboard.items or {}) do
+    if item.id ~= nil and dashboard:focus(item.id) then
+      return
+    end
+  end
+end
+
+---@param dashboard snacks.dashboard.Class
+local function showing(dashboard)
+  local win = dashboard.win
+  return win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == dashboard.buf
+end
+
 ---Switches state, starts all pages over, and redraws
 ---@param state dash-state.State
 ---@param dashboard? snacks.dashboard.Class Redraws every open dashboard when omitted
@@ -75,10 +91,22 @@ M.set_state = function(state, dashboard)
   -- All of them, not just this state's: a section with a table state reads its page under state[1],
   -- which may not be the state being entered
   M.pages = {}
-  if dashboard then
-    dashboard:update()
-  else
+  if not dashboard then
     require('snacks').dashboard.update()
+    return
+  end
+
+  -- snacks keeps the cursor on the same item by id; when that item isn't in the new view it falls
+  -- back to the nearest row, which means nothing after a view switch. Start at the top instead.
+  local before = showing(dashboard) and dashboard:find(vim.api.nvim_win_get_cursor(dashboard.win))
+  dashboard:update()
+  -- update() does nothing once the dashboard buffer is gone, and the window may show something else
+  if not showing(dashboard) then
+    return
+  end
+  local id = before and before.id
+  if not (id ~= nil and dashboard:focus(id)) then
+    focus_first(dashboard)
   end
 end
 
@@ -173,21 +201,43 @@ local function expandable(opts, spec)
   end
 
   return function(dashboard)
-    local resolved = dashboard:resolve(content, {}, opts)
+    -- Pinned rows (e.g. a summary from a transform) stay on top, outside the limit and the pages
+    local pinned, resolved = {}, {}
+    for _, item in ipairs(dashboard:resolve(content, {}, opts)) do
+      table.insert(item.pinned and pinned or resolved, item)
+    end
 
     if collapsed then
       if #resolved > spec.limit then
         resolved = vim.list_slice(resolved, 1, spec.limit)
         resolved[spec.limit + 1] = show_more_item(opts, dashboard)
       end
-      return resolved
+      return { pinned, resolved }
     end
-    return spec.open(resolved, dashboard)
+    return { pinned, spec.open(resolved, dashboard) }
   end
 end
 
+local command = require('dash-state.command')
+
+---Reruns command sections now; with no key, all of them
+M.refresh = command.refresh
+
 M.extension = {
+  formats = { command_row = command.format },
   templates = {
+    ---Runs a command in the background (cached for `ttl` seconds) and turns its output into items
+    ---  cmd: list (run directly) or string (run through 'shell')
+    ---  parse: fun(stdout, ctx) -> items; items may use `texts` chunks, where a `flex` chunk is truncated to fit
+    ---  See dash-state.CommandOpts for the rest
+    ---@param opts dash-state.CommandOpts
+    command = command.template,
+
+    ---Resolves its children, then passes the rows through `fn(items, ctx) -> items`
+    ---  limit: applied after fn; rows with `pinned = true` don't count, and page/show_more keep them on top
+    ---@param opts dash-state.TransformOpts
+    transform = require('dash-state.transform').template,
+
     ---Creates a section that displays when the state is set
     ---  as: The built-in section or template to use when enabled
     ---  state: The state or set of states to be enabled on.  Default: nil, displays when no state.
